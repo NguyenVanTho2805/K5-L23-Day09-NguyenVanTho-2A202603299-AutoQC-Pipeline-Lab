@@ -35,10 +35,107 @@ Gợi ý
 - `iou_xywh` có sẵn. Dòng nhãn hỏng không được làm script chết (dùng `ds.valid_boxes` và `parse_yolo_line` trong try).
 - Kết quả phụ thuộc mạnh vào ngưỡng: calibrate chúng ở Bước 3 thay vì đoán.
 """
-from ..common import WARN, Issue, iou_xywh, parse_yolo_line  # noqa: F401
-from ..model_cache import get_preds  # noqa: F401
+from ..common import WARN, Issue, iou_xywh, parse_yolo_line
+from ..model_cache import get_preds
 
 
 def run(ds, cfg, preds=None):
-    # TODO
-    raise NotImplementedError("check second_opinion chưa làm")
+    if preds is None:
+        preds = get_preds(ds, cfg, "checker")
+    so = cfg["second_opinion"]
+    conf_thr = so["conf"]
+    min_area_px = so["min_area_px"]
+    fp_conf = so["fp_conf"]
+    iou_missing = so["iou_missing"]
+    iou_match = so["iou_match"]
+    iou_loose = so["iou_loose"]
+    n_cls = len(ds.classes)
+    issues = []
+
+    for img in ds.image_files():
+        stem = img.stem
+        if stem not in preds:
+            continue
+        if not ds.label_path(stem).exists():
+            continue
+
+        size = ds.image_size(stem)
+        if size is None:
+            continue
+        W, H = size
+
+        labels = []  # (line_no, cls, cx, cy, w, h)
+        for line_no, text in ds.read_label_lines(stem) or []:
+            try:
+                b = parse_yolo_line(text)
+            except ValueError:
+                continue
+            if 0 <= b[0] < n_cls:
+                labels.append((line_no, *b))
+
+        label_boxes = [(cls, cx, cy, w, h) for _, cls, cx, cy, w, h in labels]
+
+        # predictions for missing/loose/wrong
+        for p in preds[stem]:
+            pcls, pconf, pcx, pcy, pw, ph = p[0], p[1], p[2], p[3], p[4], p[5]
+            if pconf < conf_thr:
+                continue
+            area_px = (pw * W) * (ph * H)
+            if area_px < min_area_px:
+                continue
+            pbox = (pcx, pcy, pw, ph)
+
+            cands = []  # (iou, label_cls, label_box)
+            for lcls, *lbox in label_boxes:
+                iou = iou_xywh(pbox, tuple(lbox))
+                if iou >= iou_missing:
+                    cands.append((iou, lcls, tuple(lbox)))
+
+            if not cands:
+                issues.append(Issue(
+                    "second_opinion", WARN, "POSSIBLE_MISSING", stem,
+                    "model thấy vật mà nhãn không có box", None,
+                    {"conf": pconf},
+                ))
+                continue
+
+            same = [c for c in cands if c[1] == pcls]
+            if same:
+                best_iou = max(c[0] for c in same)
+                if best_iou < iou_loose:
+                    issues.append(Issue(
+                        "second_opinion", WARN, "POSSIBLE_LOOSE_BOX", stem,
+                        "cùng lớp nhưng box lỏng/lệch", None,
+                        {"conf": pconf, "iou": best_iou},
+                    ))
+                # else: covered by same-class label — silent
+                continue
+
+            # only other-class cands
+            best_iou = max(c[0] for c in cands)
+            if best_iou >= iou_match:
+                issues.append(Issue(
+                    "second_opinion", WARN, "POSSIBLE_WRONG_CLASS", stem,
+                    "nhãn khác lớp chồng lên vật model thấy", None,
+                    {"conf": pconf, "iou": best_iou},
+                ))
+            # ambiguous other-class IoU in [iou_missing, iou_match) → silent
+
+        # FALSE_POS: valid labels with no matching prediction (fp_conf, no area filter)
+        fp_preds = []
+        for p in preds[stem]:
+            pcls, pconf, pcx, pcy, pw, ph = p[0], p[1], p[2], p[3], p[4], p[5]
+            if pconf >= fp_conf:
+                fp_preds.append((pcx, pcy, pw, ph))
+
+        for line_no, lcls, lcx, lcy, lw, lh in labels:
+            lbox = (lcx, lcy, lw, lh)
+            if any(iou_xywh(lbox, pb) >= iou_missing for pb in fp_preds):
+                continue
+            issues.append(Issue(
+                "second_opinion", WARN, "POSSIBLE_FALSE_POS", stem,
+                "box nhãn không khớp dự đoán nào của model", line_no,
+                {"iou": 0.0},
+            ))
+
+    return issues

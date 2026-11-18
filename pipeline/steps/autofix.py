@@ -27,13 +27,154 @@ Bẫy cần nghĩ tới (có test cho từng cái)
 
 Gợi ý: `yaml.safe_load / safe_dump`.
 """
-from collections import defaultdict  # noqa: F401
+from collections import defaultdict
 
-import yaml  # noqa: F401
+import yaml
 
-from ..common import ERROR, parse_yolo_line  # noqa: F401
+from ..common import ERROR, parse_yolo_line
+
+DROP_CODES = {"BAD_FORMAT", "BAD_CLASS_ID", "BOX_ZERO", "DUP_BOX"}
+REMOVE_CODES = {"LEAK_TEST", "CORRUPT_IMAGE", "BAD_SIZE"}
+
+
+def _is_remove(code: str) -> bool:
+    return code in REMOVE_CODES or code.startswith("DUP_IMAGE_")
+
+
+def _clip_box(cls, cx, cy, w, h):
+    left, right = cx - w / 2, cx + w / 2
+    top, bottom = cy - h / 2, cy + h / 2
+    left = max(0.0, min(1.0, left))
+    right = max(0.0, min(1.0, right))
+    top = max(0.0, min(1.0, top))
+    bottom = max(0.0, min(1.0, bottom))
+    nw, nh = right - left, bottom - top
+    if nw <= 0 or nh <= 0:
+        return None
+    return cls, (left + right) / 2, (top + bottom) / 2, nw, nh
 
 
 def fix(ds, issues, cfg):
-    # TODO
-    raise NotImplementedError("autofix chưa làm")
+    fixes = []
+    errors = [i for i in issues if i.severity == ERROR]
+
+    # 1) remove images first
+    removed = set()
+    for iss in errors:
+        if not _is_remove(iss.code):
+            continue
+        stem = iss.image
+        if stem in removed:
+            continue
+        ip = ds.image_path(stem)
+        before = ip.name if ip else stem
+        if ip and ip.exists():
+            ip.unlink()
+        lp = ds.label_path(stem)
+        if lp.exists():
+            lp.unlink()
+        ds._size_cache.pop(stem, None)
+        removed.add(stem)
+        fixes.append({
+            "image": stem, "line": "", "action": "remove_image",
+            "before": before, "after": "(đã xoá)",
+        })
+
+    # 2) rename classes in data.yaml
+    for iss in errors:
+        if iss.code != "BAD_CLASS_NAME":
+            continue
+        before = ds.yaml_path.read_text(encoding="utf-8") if ds.yaml_path.exists() else ""
+        data = {}
+        if ds.yaml_path.exists():
+            data = yaml.safe_load(before) or {}
+        data["names"] = list(cfg["classes"])
+        ds.yaml_path.write_text(
+            yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+        fixes.append({
+            "image": "data.yaml", "line": "", "action": "rename_classes",
+            "before": before.strip().replace("\n", " | "),
+            "after": str(cfg["classes"]),
+        })
+        break
+
+    # 3) needs_label (no file created)
+    for iss in errors:
+        if iss.code != "MISSING_LABEL_FILE":
+            continue
+        if iss.image in removed:
+            continue
+        fixes.append({
+            "image": iss.image, "line": "", "action": "needs_label",
+            "before": "(không có file)", "after": "chuyển người gán",
+        })
+
+    # 4) per-file line fixes (drop / clip), one rewrite per file
+    by_image = defaultdict(list)
+    for iss in errors:
+        if iss.image in removed:
+            continue
+        if iss.code in DROP_CODES or iss.code == "BOX_OUT_OF_IMAGE":
+            if iss.line is None:
+                continue
+            by_image[iss.image].append(iss)
+
+    for stem, stem_issues in by_image.items():
+        lp = ds.label_path(stem)
+        if not lp.exists():
+            continue
+        raw_lines = lp.read_text(encoding="utf-8", errors="replace").splitlines()
+
+        drop_lines = set()
+        clip_lines = set()
+        for iss in stem_issues:
+            if iss.code in DROP_CODES:
+                drop_lines.add(iss.line)
+            elif iss.code == "BOX_OUT_OF_IMAGE":
+                clip_lines.add(iss.line)
+        # drop wins over clip
+        clip_lines -= drop_lines
+
+        new_lines = []
+        file_fixes = []
+        for idx, text in enumerate(raw_lines, 1):
+            if idx in drop_lines:
+                file_fixes.append({
+                    "image": stem, "line": idx, "action": "drop_line",
+                    "before": text, "after": "(xoá)",
+                })
+                continue
+            if idx in clip_lines and text.strip():
+                try:
+                    cls, cx, cy, w, h = parse_yolo_line(text)
+                except ValueError:
+                    file_fixes.append({
+                        "image": stem, "line": idx, "action": "drop_line",
+                        "before": text, "after": "(xoá)",
+                    })
+                    continue
+                clipped = _clip_box(cls, cx, cy, w, h)
+                if clipped is None:
+                    file_fixes.append({
+                        "image": stem, "line": idx, "action": "drop_line",
+                        "before": text, "after": "(xoá)",
+                    })
+                    continue
+                c2, x2, y2, w2, h2 = clipped
+                after = f"{c2} {x2:g} {y2:g} {w2:g} {h2:g}"
+                # keep a stable readable form close to test expectation
+                after = f"{c2} {x2} {y2} {w2} {h2}"
+                file_fixes.append({
+                    "image": stem, "line": idx, "action": "clip_box",
+                    "before": text, "after": after,
+                })
+                new_lines.append(after)
+                continue
+            new_lines.append(text)
+
+        lp.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
+        fixes.extend(file_fixes)
+
+    return fixes
