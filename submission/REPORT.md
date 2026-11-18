@@ -32,7 +32,7 @@ Nguồn: `02_error_list_v1.csv` — **210** issue trên **148** ảnh (sau intak
 
 `03_fixes.csv`: **35** thay đổi = drop_line 20 + clip_box 8 + needs_label 6 + rename_classes 1. Sau sửa (`04_*`): còn **6 ERROR** (đều `MISSING_LABEL_FILE`) và **148 WARN**.
 
-Hàng đợi `05_review_queue.csv`: **125** ảnh. Đầu hàng: `img_0020` (priority 11.5: FIXED_DROP_LINE + MISSING + WRONG_CLASS), rồi các `NEEDS_LABEL` (priority 10) — khớp `review.weights` (NEEDS_LABEL=10, WRONG_CLASS=3, MISSING=2). Ngân sách **80/125** (~64% hàng đợi): ưu tiên ảnh thiếu nhãn và nghi ngữ nghĩa; **45** ảnh còn lại chưa xem vẫn tính vào warn_ratio → giữ Hold.
+Hàng đợi `05_review_queue.csv`: **125** ảnh. Đầu hàng: `img_0020` (priority 11.524: FIXED_DROP_LINE + MISSING + WRONG_CLASS), rồi các `NEEDS_LABEL` (priority 10) — khớp `review.weights` (NEEDS_LABEL=10, WRONG_CLASS=3, MISSING=2). Ngân sách **80/125** (~64% hàng đợi): ưu tiên ảnh thiếu nhãn và nghi ngữ nghĩa; **45** ảnh còn lại chưa xem vẫn tính vào warn_ratio → giữ Hold.
 
 Sau duyệt (`07_*`): **71** WARN / **0** ERROR; còn nhiều `POSSIBLE_FALSE_POS` (21) và `LOOSE_BOX` (20) trên ảnh ngoài ngân sách.
 
@@ -63,11 +63,25 @@ Từ `submission/calibration/calibration_report.md`:
 
 ## 5. Train: raw vs clean (tùy chọn)
 
-**Chưa chạy.** Phần lõi (4 module, calibrate, pipeline, báo cáo) ưu tiên trước; train Colab (yolo26n, 2 seed) để làm khi có GPU — tối đa 85/100 nếu bỏ qua mục này.
+Đã chạy trên Colab (yolo26n, 20 epoch, batch 16, imgsz 640, seed 0 & 1). Bảng từ `submission/results/comparison.md`:
+
+| biến thể | #ảnh train | map50 (TB ± σ) | map50_95 | precision | recall |
+|---|---:|---|---|---|---|
+| raw | 224 | 0.726 ± 0.000 | 0.512 ± 0.004 | 0.764 ± 0.061 | 0.649 ± 0.028 |
+| clean | 203 | 0.699 ± 0.025 | 0.486 ± 0.013 | 0.796 ± 0.050 | 0.596 ± 0.049 |
+
+Chênh mAP50 (clean − raw) = **−0.027**. Độ lệch giữa 2 seed của clean là **±0.025** → mức chênh **nằm trong nhiễu seed**, **chưa kết luận được** clean tốt hơn raw (thậm chí TB clean hơi thấp hơn).
+
+Giả thuyết giải thích / cách kiểm:
+1. **Ít ảnh train hơn** (203 vs 224 vì intake loại trùng/rò rỉ/hỏng) — kiểm: so AP theo lớp; truck clean seed0 chỉ 0.48 vs raw 0.66.
+2. **Raw có thể hưởng lợi từ rò rỉ test** (5 LEAK_TEST đã loại) — kiểm: đối chiếu stem bị LEAK với `data/test`.
+3. **Clean vẫn là bản Hold** (38 ảnh còn WARN chưa duyệt) — nhãn ngữ nghĩa chưa sạch hết có thể kéo recall xuống (0.596 vs 0.649).
+
+Việc tiếp theo: tăng ngân sách duyệt rồi train lại clean; hoặc báo cáo Hold trung thực thay vì tối ưu mAP bằng cách nới QC.
 
 ## 6. Quyết định và ghi chú AI
 
-**(a) Quyết định cuối: Hold.** Khớp số liệu v3 (0 ERROR, 38/203 ảnh WARN). Để thành Release cần đưa warn_ratio < 10% (≤ **20** ảnh cảnh báo trên 203), ví dụ: tăng ngân sách duyệt thêm ~45 ảnh còn lại trong hàng đợi, hoặc sau khi người xem xong thì siết/gỡ WARN đã xử lý; đồng thời **phải** gán nhãn 6 ảnh `MISSING_LABEL_FILE` (nếu bỏ qua → Rework, không xuất).
+**(a) Quyết định cuối: Hold.** Khớp số liệu v3 (**0 ERROR**, **38/203** ảnh còn WARN). Sáu ảnh `MISSING_LABEL_FILE` đã nằm đầu hàng đợi và được ngân sách 80 xử lý (v3 không còn ERROR). Để thành Release cần đưa warn_ratio < 10% (≤ **20** ảnh cảnh báo trên 203): tăng ngân sách duyệt thêm ~45 ảnh còn lại, hoặc siết ngưỡng `second_opinion` rồi chạy lại — không được “xóa tay” WARN để ép Release.
 
 **(b) Dùng AI hỗ trợ viết 4 module.**
 
